@@ -63,16 +63,28 @@ function passthru_json($raw, $extra = array())
 
 function qq_cookie()
 {
-    $cookie = getenv('METING_QQ_COOKIE');
+    return meting_cookie('qq');
+}
+
+/**
+ * P16 源 cookie 注入: 统一入口, 按源读环境变量或 config.php
+ *   kugou  → METING_KUGOU_COOKIE / config.php $meting_config['kugou_cookie']  (酷狗 VIP, VIP 歌出整曲直链)
+ *   netease→ METING_NETEASE_COOKIE / config.php $meting_config['netease_cookie'] (网易 VIP)
+ * 不配置不影响搜索/歌词/封面, 只是对应源 VIP 歌出不了直链 (kugou 无 cookie 实测 url 为空)
+ */
+function meting_cookie($source)
+{
+    $env = 'METING_' . strtoupper($source) . '_COOKIE';
+    $cookie = getenv($env);
     if ($cookie !== false && $cookie !== '') {
         return $cookie;
     }
-    $file = __DIR__ . '/config.php';
-    if (is_file($file)) {
+    if (is_file(__DIR__ . '/config.php')) {
         $meting_config = array();
-        include $file;
-        if (!empty($meting_config['qq_cookie'])) {
-            return $meting_config['qq_cookie'];
+        include __DIR__ . '/config.php';
+        $key = $source . '_cookie';
+        if (!empty($meting_config[$key])) {
+            return $meting_config[$key];
         }
     }
     return '';
@@ -158,6 +170,13 @@ $meting = new Meting($source);
 $meting->format(true);
 if ($source === 'tencent') {
     $cookie = qq_cookie();
+    if ($cookie !== '') {
+        $meting->cookie($cookie);
+    }
+}
+// P16: kugou / netease 也支持 cookie 注入 (VIP 整曲直链); kugou 无 cookie 时 VIP 歌 url 为空
+if (in_array($source, array('kugou', 'netease'), true)) {
+    $cookie = meting_cookie($source);
     if ($cookie !== '') {
         $meting->cookie($cookie);
     }

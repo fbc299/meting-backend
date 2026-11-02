@@ -35,6 +35,11 @@ if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'OPTIONS
     exit;
 }
 
+// 公开部署防护：每 IP 60 秒最多 300 次（5 req/s），超限 429。
+// 300 是给「首次封面刮削」留的余量：整库逐首串行搜索约 90–150 req/min；仍能挡住滥用型刷接口。
+$rateLimit = (int) getenv('METING_RATE_LIMIT');
+rate_limit($rateLimit > 0 ? $rateLimit : 300, 60);
+
 function respond($payload, $status = 200)
 {
     http_response_code($status);
@@ -45,6 +50,56 @@ function respond($payload, $status = 200)
 function fail($message, $status = 400)
 {
     respond(array('code' => 1, 'message' => $message), $status);
+}
+
+/**
+ * 轻量按 IP 限流（滑动 60 秒窗口，计数落盘 + flock 原子，PHP 多 worker 共用）。
+ * 公开部署下防止被当成免费音乐 API 刷：默认每 IP 60 秒最多 120 次请求。
+ * 超限返回 429，客户端（App）应把它当作「稍后再试」而不是致命错误。
+ */
+function rate_limit($limit = 120, $windowSec = 60)
+{
+    $ip = isset($_SERVER['REMOTE_ADDR']) ? (string) $_SERVER['REMOTE_ADDR'] : 'unknown';
+    $dir = __DIR__ . '/logs/ratelimit';
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0700, true);
+    }
+    if (!is_dir($dir) || !is_writable($dir)) {
+        return; // 目录不可写时不影响正常服务
+    }
+    $file = $dir . '/' . preg_replace('/[^0-9a-fA-F:.]/', '', $ip) . '.json';
+    $now  = time();
+    $fp   = @fopen($file, 'c+');
+    if ($fp === false) {
+        return;
+    }
+    try {
+        if (!flock($fp, LOCK_EX)) {
+            return;
+        }
+        $raw    = stream_get_contents($fp);
+        $bucket = json_decode((string) $raw, true);
+        if (!is_array($bucket) || !isset($bucket['start'], $bucket['count'])
+            || ($now - (int) $bucket['start']) >= $windowSec) {
+            $bucket = array('start' => $now, 'count' => 0);
+        }
+        $bucket['count'] = (int) $bucket['count'] + 1;
+        $retry = max(1, $windowSec - ($now - (int) $bucket['start']));
+        ftruncate($fp, 0);
+        rewind($fp);
+        fwrite($fp, json_encode($bucket));
+        fflush($fp);
+        flock($fp, LOCK_UN);
+        if ((int) $bucket['count'] > $limit) {
+            header('Retry-After: ' . $retry);
+            respond(array(
+                'code'    => 1,
+                'message' => 'rate limit exceeded, retry after ' . $retry . 's',
+            ), 429);
+        }
+    } finally {
+        fclose($fp);
+    }
 }
 
 /** 把类库返回的 JSON 字符串原样透出（转义改成可读形式） */
@@ -107,8 +162,10 @@ $name = isset($_GET['name']) ? trim($_GET['name'])
       : (isset($_GET['keyword']) ? trim($_GET['keyword'])
       : (isset($_GET['w']) ? trim($_GET['w']) : ''));
 $br   = isset($_GET['br']) ? intval($_GET['br']) : 320;
-$size = isset($_GET['size']) ? intval($_GET['size']) : 300;
-$n    = isset($_GET['n']) ? max(1, intval($_GET['n'])) : (isset($_GET['limit']) ? max(1, intval($_GET['limit'])) : 30);
+$size = isset($_GET['size']) ? min(2000, max(50, intval($_GET['size']))) : 300;
+// n 上限 50：无上限时 n=100000 会被原样转发给上游（实测 0.5s 返回，可被用来压上游/触发风控）
+$n    = isset($_GET['n']) ? min(50, max(1, intval($_GET['n'])))
+      : (isset($_GET['limit']) ? min(50, max(1, intval($_GET['limit']))) : 30);
 $s    = isset($_GET['s']) ? max(0, intval($_GET['s'])) : (isset($_GET['offset']) ? max(0, intval($_GET['offset'])) : 0);
 $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 0;
 
@@ -159,7 +216,12 @@ if (in_array($source, array('kuwo', 'migu'), true) && in_array($type, array('sea
                 respond(sx_lyric($source, $id));
         }
     } catch (Exception $e) {
-        fail($e->getMessage(), 502);
+        $msg = $e->getMessage();
+        // 上游「空结果」不是故障：按 200 + 空数组返回，避免客户端把空结果当网络错误
+        if (stripos($msg, 'empty result') !== false) {
+            respond(array());
+        }
+        fail($msg, 502);
     }
 }
 if ($source === 'migu') {
